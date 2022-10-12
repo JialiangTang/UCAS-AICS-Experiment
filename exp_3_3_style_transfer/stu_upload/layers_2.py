@@ -72,28 +72,45 @@ class ConvolutionalLayer(object):
         width = self.W + self.padding * 2
         self.input_pad = np.zeros([self.N, self.C, height, width])
         self.input_pad[:, :, self.padding:self.padding+self.H, self.padding:self.padding+self.W] = self.input
-        height_out = (height - self.kernel_size) // self.stride + 1
-        width_out = (width - self.kernel_size) // self.stride + 1
+        self.height_out = (height - self.kernel_size) // self.stride + 1
+        self.width_out = (width - self.kernel_size) // self.stride + 1
         
-        self.col_input = img2col(self.input_pad, height_out, width_out, self.kernel_size, self.stride)
-        self.col_input = self.col_input.reshape(self.col_input.shape[0], -1, self.col_input.shape[3]) # N,c_in*K*K,H*W
-        self.col_weights = self.weight.transpose(3, 0, 1, 2).reshape(self.weight.shape[-1], -1) # c_out, c_in*K*K
-        output = np.matmul(self.col_weights, self.col_input) + self.bias.reshape(-1, 1)
-        self.output = output.reshape(self.N, self.channel_out, height_out, width_out)
+        # self.col_input = img2col(self.input_pad, height_out, width_out, self.kernel_size, self.stride)
+        # self.col_input = self.col_input.reshape(self.col_input.shape[0], -1, self.col_input.shape[3]) # N,c_in*K*K,H*W
+        # self.col_weights = self.weight.transpose(3, 0, 1, 2).reshape(self.weight.shape[-1], -1) # c_out, c_in*K*K
+        # output = np.matmul(self.col_weights, self.col_input) + self.bias.reshape(-1, 1)
+        # self.output = output.reshape(self.N, self.channel_out, height_out, width_out)
+
+        self.weight_reshape = np.reshape(self.weight, [-1, self.channel_out]) #卷积核向量化, c_in*K*K,c_out
+        self.img2col = np.zeros([self.N*self.height_out*self.width_out, \
+                                self.channel_in*self.kernel_size*self.kernel_size])
+        for idxn in range(self.N):
+            for idxh in range(self.height_out):
+                for idxw in range(self.width_out):
+                    self.img2col[idxn*self.height_out*self.width_out + idxh*self.width_out + idxw, :] = \
+                        self.input_pad[idxn, : ,idxh*self.stride:idxh*self.stride+self.kernel_size,\
+                        idxw*self.stride:idxw*self.stride+self.kernel_size].reshape([-1])
+        #计算前向传播
+        output = np.dot(self.img2col,self.weight_reshape) + self.bias
+        #对输出结果重排列
+        self.output = output.reshape([self.N, self.height_out, self.width_out, -1]).transpose([0,3,1,2])
 
         self.forward_time = time.time() - start_time
         return self.output
     def backward_speedup(self, top_diff):
         # TODO: 改进backward函数，使得计算加速
         start_time = time.time()
-
-        height_pad = self.H + self.padding * 2
-        width_pad = self.W + self.padding * 2
-        _top_diff = top_diff.transpose(1, 2, 3, 0).reshape(self.channel_out, -1) # c_out, H*W*N
-        col_bottom_diff = np.matmul(self.col_weights.T, _top_diff)
-        col_bottom_diff = col_bottom_diff.reshape(col_bottom_diff.shape[0], -1, self.N).transpose(2, 0, 1) # N,c_in*K*K,H*W
-        bottom_diff = col2img(col_bottom_diff, height_pad, width_pad, self.kernel_size, self.channel_in, self.padding, self.stride)
-
+        bottom_diff = np.zeros(self.input_pad.shape) #padding the bottom_diff
+        height_pad = self.H + self.padding * 2-2  #avoid the shape error
+        width_pad = self.W + self.padding * 2-2
+        top_diff_reshape = top_diff.transpose(0, 2, 3, 1).reshape([-1, self.channel_out]) # N*H*W, c_out
+        bottom_diff_col = np.matmul(top_diff_reshape, self.weight_reshape.T) #N*H*W, c_in*K*K
+        for idxn in range(self.N):
+            for idxh in range(height_pad):
+                for idxw in range(width_pad):
+                    bottom_diff[idxn, : ,idxh*self.stride:idxh*self.stride+self.kernel_size, idxw*self.stride:idxw*self.stride+self.kernel_size] += bottom_diff_col[idxn*height_pad*width_pad + idxh*width_pad + idxw, :].reshape(self.C,self.kernel_size,self.kernel_size)
+        bottom_diff = bottom_diff[:, :, self.padding:self.padding+self.input.shape[2], self.padding:self.padding+self.input.shape[3]]
+        
         self.backward_time = time.time() - start_time
         return bottom_diff
     def backward_raw(self, top_diff):
